@@ -1,0 +1,492 @@
+---
+title: Identification of robust and abundant reference transcripts for EV mRNA cargo normalization
+author: Radosław Grochowski
+affiliation: Karolinska Institutet, Stockholm
+date: 2024
+---
+
+# Identification of robust and abundant reference transcripts for EV mRNA cargo normalization
+
+## Description
+
+Following notebook contains code used for RNA-seq data analysis and visualization
+for Zickler et al. (2025). RPKM values are calculated and ranked for EV samples 
+of various origin.
+
+## Code
+### Setup
+```{r setup}
+library(edgeR) # for RPKM calculation
+library(GenomicFeatures) # used for gene length calculation from GTF files
+library(annotables) # Ensembl id to symbol conversion
+library(dplyr) # data handling
+library(data.table) # data handling
+library(Matrix) # data handling
+library(ggplot2) # visualization
+library(ggpubr) # visualization
+library(ggnewscale) # visualization
+
+# set the theme for plotting
+theme_set(new = theme_minimal())
+theme_update(
+    strip.background = element_rect(fill = "#FFFFFF"),
+    plot.title = element_text(hjust = 0.5, size = 19),
+    plot.subtitle = element_text(size = 13, hjust = .5),
+    axis.title = element_text(size = 15),
+    axis.text.y = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(size = 12, vjust = 0.5),
+    legend.text = element_text(size = 13),
+    legend.key.size = unit(2, "line"),
+    legend.title = element_text(size = 15, hjust = .5, vjust = .5)
+)
+
+# That's not necessary (rmarkdown sets its 
+# working directory to where the .Rmd file is.)
+wd <- "working directory"
+knitr::opts_knit$set(root.dir = wd)
+
+# Lapply functions
+
+# calculate min RPKM setting the value
+# to 0 if any of the replicates is 0
+calc_mean_rpkm_w0 <- function(group, dt_rpkm) {
+    dt_rpkm <- as.data.table(dt_rpkm)
+    rpkm <- dt_rpkm[, colnames(dt_rpkm) %like% group, with = FALSE]
+    # replace rows with at least one 0 with 0s
+    rpkm <- apply(rpkm, 1, function(x) {
+        x[any(x == 0)] <- 0
+        return(x)
+    })
+    # transpose after apply
+    rpkm <- t(rpkm)
+    # calculate means
+    matrix <- matrix(rowSums(rpkm) / dim(rpkm)[2])
+    colnames(matrix) <- group
+    return(matrix)
+}
+# without zero removal for calculations for plasma samples
+calc_mean_rpkm <- function(group, dt_rpkm) {
+    dt_rpkm <- as.data.table(dt_rpkm)
+    rpkm <- dt_rpkm[, colnames(dt_rpkm) %like% group, with = F]
+    # calculate means
+    matrix <- matrix(rowSums(rpkm)/dim(rpkm)[2])
+    colnames(matrix) <- group
+    return(matrix)
+}
+
+# a function sorting genes in a column and returning
+# a data.table with gene and sample names
+rank_genes <- function(sample, dt_rpkm, gene) {
+    # set a dt
+    dt <- data.table("rpkm" = dt_rpkm[, sample])
+    # add gene ids
+    dt$gene_id <- gene[, gene_id]
+    # add gene names (symbols)
+    dt$symbol <- gene[, symbol]
+    # add sample
+    dt[, sample := sample]
+    # sum the expression per symbol
+    dt[, rpkm := sum(rpkm), by = .(symbol)]
+    # remove duplicated symbols
+    dt <- unique(dt, by = "symbol")
+    # sort the genes
+    dt <- dt[order(rpkm, decreasing = T)]
+    # rank the gens
+    dt$rank <- 1:nrow(dt)
+    # set the min rank to the min of the first 0 gene
+    dt[rpkm == 0, rank := min(rank)]
+
+    return(dt)
+}
+
+
+# Gene names for conversion of Ensembl ids
+grch37_gene <- as.data.table(grch37[, c("ensgene", "symbol")])
+grch38_gene <- as.data.table(grch38[, c("ensgene", "symbol")])
+colnames(grch37_gene)[1] <- "gene_id"
+colnames(grch38_gene)[1] <- "gene_id"
+```
+
+
+```{r}
+# Gene lengths
+# GRCh38
+gtfFile38 <- "Homo_sapiens.GRCh38.111.gtf"
+txdb38 <- makeTxDbFromGFF(gtfFile38, format = "gtf")
+exonic38 <- exonsBy(txdb38, by = "gene")
+red_exonic38 <- reduce(exonic38)
+exon_lengths38 <- data.frame("exon_lengths" = vapply(
+    width(red_exonic38),
+    sum, numeric(1)
+))
+exon_lengths38$gene_id <- rownames(exon_lengths38)
+# GRCh37
+gtfFile37 <- "Homo_sapiens.GRCh37.87.gtf"
+txdb37 <- makeTxDbFromGFF(gtfFile37, format = "gtf")
+exonic37 <- exonsBy(txdb37, by = "gene")
+red_exonic37 <- reduce(exonic37)
+exon_lengths37 <- data.frame("exon_lengths" = vapply(
+    width(red_exonic37),
+    sum, numeric(1)
+))
+exon_lengths37$gene_id <- rownames(exon_lengths37)
+```
+
+
+### Cultured media EVs
+
+#### Gene ranking
+```{r}
+# load the data
+cell_rpkm <- fread("cell_culture_ev_rpkm.csv",
+    drop = 1
+)
+cell_gene <- cell_rpkm[, 1]
+cell_rpkm <- cell_rpkm[, -1]
+# make a dt with gene names
+gt <- data.table(cell_gene)
+gt_join <- grch37_gene[gt, on = .(gene_id), mult = "first"][
+    is.na(symbol) | symbol == "",
+    symbol := gene_id
+] # retain unique ENSEMBL ids
+# get the cell types
+cell_types <- unique(gsub(
+    "_[1-3]", "",
+    colnames(cell_rpkm)
+))
+# calculate mean rpkm values per cell type
+cell_mean_rpkm <- sapply(cell_types,
+    calc_mean_rpkm_w0,
+    dt_rpkm = cell_rpkm
+)
+# rank genes
+cell_mean_rank <- lapply(cell_types,
+    rank_genes,
+    dt_rpkm = cell_mean_rpkm,
+    gene = gt_join
+)
+# turn the list into a data.table
+cell_mean_rank <- bind_rows(cell_mean_rank)
+setnames(cell_mean_rank, "rpkm", "mean_rpkm")
+# set cell type order
+cell_type_order <- rev(c(
+    "BM-MSC", "CB-MSC", "BJ-5ta", "WJ-MSC",
+    "HEK293-T", "HEK293-FS", "CAP", "HAEC",
+    "HUVEC", "PANC-1", "THP-1", "JURKAT"
+))
+cell_mean_rank[, cell_type := factor(sample, levels = cell_type_order)]
+setkey(cell_mean_rank, sample)
+# calculate rank sums
+cell_rank_sum <- cell_mean_rank[, sum(rank), by = .(gene_id, symbol)]
+# order the genes
+cell_order_symbol <- cell_rank_sum[order(V1), symbol]
+# remove those that repeat
+cell_order_symbol <- unique(cell_order_symbol)
+```
+#### Plotting
+
+##### Fig.1C
+
+```{r fig.width=14.4, fig.height=7.5}
+# color-code cell types
+y_labels_color <- rev(c(
+    "green3", "green3", "green3", "green3",
+    "blue", "blue",
+    "gray35", "gray35",
+    "red", "red",
+    "orange", "orange"
+))
+# color chosen gene names
+x_labels_color <- ifelse(cell_order_symbol[1:50] %in% c(
+    "MT-RNR2", "RP11-217O12.1", "ACTB",
+    "MALAT1", "FTL", "GAPDH",
+    "BCYRN1", "TMSB4X", "FN1",
+    "VIM", "BEST1"
+),
+"red", "grey30" # default color is grey30
+) 
+# change font face of chosen gene names
+x_labels_face <- ifelse(cell_order_symbol[1:50] %in% c(
+    "MT-RNR2", "RP11-217O12.1", "ACTB",
+    "MALAT1", "FTL", "GAPDH",
+    "BCYRN1", "TMSB4X", "FN1",
+    "VIM", "BEST1"
+),
+"bold", "plain"
+)
+
+ggplot(cell_mean_rank[symbol %in% cell_order_symbol[1:50] & mean_rpkm > 1000]) +
+    geom_tile(
+        data = cell_mean_rank[symbol %in% cell_order_symbol[1:50]],
+        aes(
+            x = factor(symbol, levels = cell_order_symbol),
+            y = factor(cell_type, levels = cell_type_order),
+            fill = "RPKM < 1000"
+        ), linetype = 0
+    ) +
+    scale_fill_manual(values = "gray55") +
+    labs(fill = "") +
+    new_scale_fill() +
+    geom_tile(aes(
+        x = factor(symbol, levels = cell_order_symbol),
+        y = factor(cell_type, levels = cell_type_order),
+        fill = mean_rpkm
+    )) +
+    labs(fill = "Mean RPKM") +
+    scale_fill_gradientn(trans = "log10", colours = c("blue", "white", "red")) +
+    ggtitle("Top 50 genes above the 1000 RPKM threshold across cell line EV samples") +
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title = element_text(hjust = .5),
+        axis.text.y = ggtext::element_markdown(
+            hjust = 1,
+            colour = y_labels_color
+        ),
+        axis.text.x = ggtext::element_markdown(
+            hjust = 1,
+            colour = x_labels_color,
+            face = x_labels_face
+        )
+    )
+```
+
+##### Supplementary Fig.S2A
+
+```{r, fig.width=14, fig.height=7.5}
+ggplot(cell_mean_rank[symbol %in% cell_order_symbol[1:50]]) +
+    geom_tile(aes(
+        x = factor(symbol, levels = cell_order_symbol[1:50]),
+        y = factor(cell_type, levels = cell_type_order),
+        fill = mean_rpkm
+    )) +
+    scale_fill_gradientn(trans = "log10", colours = c("blue", "white", "red")) +
+    ggtitle("Top 50 genes across cell line EV samples") +
+    labs(x = "gene id", fill = "Mean RPKM") +
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = ggtext::element_markdown(
+            hjust = 1,
+            colour = y_labels_color
+        )
+    )
+```
+
+##### Supplementary Fig.S5A
+
+```{r fig.width=7, fig.height=5}
+order_chosen_genes <- which(cell_order_symbol %in% c(
+    "ACTB", "FTL",
+    "GAPDH", "TMSB4X",
+    "FN1", "VIM",
+    "BEST1", "RAB13"
+))
+
+ggplot(cell_mean_rank[symbol %in% cell_order_symbol[order_chosen_genes]]) +
+    geom_boxplot(aes(
+        x = factor(symbol, levels = cell_order_symbol),
+        y = rank
+    )) +
+    geom_point(aes(
+        x = factor(symbol, levels = cell_order_symbol),
+        y = rank
+    )) +
+    scale_y_log10() +
+    ggtitle("Rank spread of chosen genes\nacross cell line EV samples") +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title = element_text(hjust = .5),
+        plot.margin = unit(c(0, 0, 0, .5), "cm")
+    )
+```
+
+## Biological fluids EVs (without plasma)
+
+```{r}
+flu <- fread("biofluids_ev_counts.csv", drop = 1)
+flu_gene <- flu[, 1]
+flu <- flu[, -1]
+# make a dt with gene names
+gt <- data.table(flu_gene)
+gt_join <- grch38_gene[gt, on = .(gene_id), mult = "first"
+                       ][is.na(symbol) | symbol == "", symbol := gene_id]
+# match the gene length with the counts
+flu_exon_lengths <- exon_lengths38[match(
+    flu_gene$gene_id,
+    exon_lengths38$gene_id
+), ]
+# calculate RPKM values
+flu_rpkm <- rpkm(flu, gene.length = flu_exon_lengths$exon_lengths)
+# rank genes
+flu_rank <- lapply(colnames(flu_rpkm),
+    rank_genes,
+    dt_rpkm = flu_rpkm,
+    gene = gt_join
+)
+# turn the list into a data.table
+flu_rank <- bind_rows(flu_rank)
+# add a column with sample type
+flu_rank[, sample_type := gsub(".*_", "", sample)]
+# add a column with donor and format it
+flu_rank[, donor := regmatches(sample, regexpr("donor_[1-9]", sample))
+         ][, donor := gsub("_", " ", donor)
+           ][, donor := gsub("d", "D", donor)]
+# calculate rank sums per sample type
+flu_rank_sum <- flu_rank[, sum(rank), by = .(gene_id, symbol, sample_type)]
+# order_id_flu <- flu_rank_sum[order(V1), gene_id, by = sample_type]
+flu_order_symbol <- flu_rank_sum[order(V1), symbol, by = sample_type]
+# remove those that repeat
+flu_order_symbol <- flu_order_symbol[, symbol := .SD[, unique(symbol)],
+    by = sample_type
+]
+```
+
+#### Fig.5E (urine EVs) and Supplementary Fig.S7B-D
+
+```{r, fig.width=14, fig.height=5}
+# set the donor order
+flu_donor <- rev(c(
+    "Donor 1", "Donor 2", "Donor 3", "Donor 4",
+    "Donor 5", "Donor 6", "Donor 7", "Donor 8"
+))
+
+plots <- lapply(unique(flu_rank$sample_type), function(x) {
+    # color-code chosen genes
+    x_labels_color <- ifelse(
+        flu_order_symbol[sample_type == x
+                       ][1:50, symbol] %in% c("GAPDH", "ACTB", 
+                                              "TMSB4X", "VIM", "FTL"), 
+        "red", "black")
+
+    ggplot(flu_rank[sample_type == x & 
+                      symbol %in% flu_order_symbol[sample_type == x
+                                                   ][1:50, symbol]]) +
+        geom_tile(aes(
+            x = factor(symbol, 
+                       levels = flu_order_symbol[sample_type == x
+                                                 ][1:50, symbol]),
+            y = factor(donor, levels = flu_donor),
+            fill = rpkm
+        )) +
+        scale_fill_gradientn(trans = "log10", 
+                             colours = c("blue", "white", "red")) +
+        ggtitle(paste0("Top 50 genes across ", x, " EV samples")) +
+        labs(x = "gene id", fill = "Mean RPKM") +
+        scale_x_discrete(guide = guide_axis(angle = 45)) +
+        theme(
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            axis.line = element_blank(),
+            axis.title.x = element_blank(),
+            axis.title.y = element_blank(),
+            axis.text.x = ggtext::element_markdown(
+                hjust = 1,
+                colour = x_labels_color
+            ),
+            plot.margin = margin(.5, .5, .5, .5, "cm")
+        )
+})
+plots
+```
+
+## Plasma EVs
+
+```{r}
+plas <- fread("plasma_ev_counts.csv",
+    drop = 1
+)
+plas_genes <- plas[, 1]
+plas <- plas[, -1]
+# make a dt with gene names
+gt <- data.table(plas_genes)
+gt_join <- grch38_gene[gt, on = .(gene_id), mult = "first"
+                       ][is.na(symbol) | symbol == "", symbol := gene_id]
+# match the gene length with the counts
+plas_exon_lengths <- exon_lengths38[match(
+    plas_genes$gene_id,
+    exon_lengths38$gene_id
+), ]
+# calculate RPKM values
+plas_rpkm <- rpkm(plas, gene.length = plas_exon_lengths$exon_lengths)
+# match gene lengths with the counts
+exon_lengths <- exon_lengths38[match(
+    unlist(plas_genes, use.names = F),
+    exon_lengths38$gene_id
+), ]
+plas_rpkm <- rpkm(plas, gene.length = exon_lengths$exon_lengths)
+# get the cell types
+plas_donor <- unique(gsub(
+    "_[1-3]$", "",
+    colnames(plas_rpkm)
+))
+# calculate mean rpkm values per donor
+plas_mean_rpkm <- sapply(plas_donor,
+    calc_mean_rpkm,
+    dt_rpkm = plas_rpkm
+)
+# rank genes
+plas_mean_rank <- lapply(colnames(plas_mean_rpkm),
+    rank_genes,
+    dt_rpkm = plas_mean_rpkm,
+    gene = gt_join
+)
+# turn the list into a data.table
+plas_mean_rank <- bind_rows(plas_mean_rank)
+# add a column with donor and format it
+plas_mean_rank[, donor := regmatches(sample, regexpr("donor_[1-9]", sample))
+               ][, donor := gsub("_", " ", donor)
+                 ][, donor := gsub("d", "D", donor)]
+# add 1 to rpkm values to allow log10 transformation
+# calculate rank sums
+plas_rank_sum <- plas_mean_rank[, sum(rank), by = .(gene_id, symbol)]
+plas_order_symbol <- plas_rank_sum[order(V1), symbol]
+# remove those that repeat
+plas_order_symbol <- unique(plas_order_symbol)
+```
+
+#### Fig.5D (plasma EVs)
+
+```{r, fig.width=14, fig.height=5}
+x_labels_color <- ifelse(plas_order_symbol[1:50] %in% c("GAPDH", "ACTB", 
+                                                        "TMSB4X", "VIM", 
+                                                        "FTL"), "red", "black")
+# set donor order
+plas_donor <- rev(c(
+    "Donor 1", "Donor 2", "Donor 3",
+    "Donor 4", "Donor 5"
+))
+
+ggplot(plas_mean_rank[symbol %in% plas_order_symbol[1:50]]) +
+    geom_tile(aes(
+        x = factor(symbol, levels = plas_order_symbol[1:50]),
+        y = factor(donor, levels = plas_donor), fill = rpkm
+    )) +
+    scale_fill_gradientn(trans = "log10", colours = c("blue", "white", "red")) +
+    ggtitle("Top 50 genes across plasma EV samples") +
+    labs(x = "gene id", fill = "Mean RPKM") +
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = ggtext::element_markdown(
+            hjust = 1,
+            colour = x_labels_color
+        )
+    )
+```
